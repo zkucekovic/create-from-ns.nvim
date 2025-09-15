@@ -4,7 +4,7 @@ M.config = {
 	rules = {
 		{ pattern = "Interface", trigger = "iface" },
 		{ pattern = "Trait", trigger = "trait" },
-		{ pattern = ".*", trigger = "class" }, -- fallback
+		{ pattern = ".*", trigger = "class" },
 	},
 }
 
@@ -12,21 +12,24 @@ function M.setup(opts)
 	M.config = vim.tbl_deep_extend("force", M.config, opts or {})
 end
 
--- Load PSR-4 mapping from composer.json
+-- Parse PSR-4 from composer.json (autoload only)
 local function load_psr4()
 	local json = vim.fn.json_decode(vim.fn.readfile("composer.json"))
 	local psr4 = {}
-	for _, section in ipairs({ "autoload", "autoload-dev" }) do
-		if json[section] and json[section]["psr-4"] then
-			for ns, path in pairs(json[section]["psr-4"]) do
-				psr4[ns:gsub("\\\\", "\\")] = path
+
+	if json["autoload"] and json["autoload"]["psr-4"] then
+		for ns, paths in pairs(json["autoload"]["psr-4"]) do
+			if type(paths) == "string" then
+				psr4[ns] = { paths }
+			elseif type(paths) == "table" then
+				psr4[ns] = paths
 			end
 		end
 	end
+
 	return psr4
 end
 
--- Pick snippet trigger based on filename
 local function pick_trigger(filename)
 	for _, rule in ipairs(M.config.rules) do
 		if filename:match(rule.pattern) then
@@ -40,11 +43,11 @@ function M.create_from_namespace()
 	local word = vim.fn.expand("<cWORD>"):gsub("^\\", "")
 	local psr4 = load_psr4()
 
-	-- find best matching prefix
+	-- find best matching namespace prefix
 	local best_prefix, best_path
-	for ns, path in pairs(psr4) do
+	for ns, paths in pairs(psr4) do
 		if word:sub(1, #ns) == ns and (#ns > #(best_prefix or "")) then
-			best_prefix, best_path = ns, path
+			best_prefix, best_path = ns, paths[1] -- pick first path
 		end
 	end
 	if not best_prefix then
