@@ -1,3 +1,4 @@
+-- lua/create_from_ns/init.lua
 local M = {}
 
 M.config = {
@@ -6,7 +7,7 @@ M.config = {
 		{ pattern = "Trait", trigger = "trait" },
 		{ pattern = ".*", trigger = "class" },
 	},
-	keymap = nil, -- optional: { "n", "<leader>cn" }
+	keymap = nil, -- optional: { "n", "<leader>cn" } or { "n", "<leader>cn", "<cmd>CreateFromNS<CR>", { silent = true } }
 }
 
 function M.setup(opts)
@@ -17,12 +18,23 @@ function M.setup(opts)
 	end
 end
 
--- Parse PSR-4 from composer.json (autoload only)
+-- --- helpers ---------------------------------------------------------------
+
+-- Parse PSR-4 (autoload only), using tdd.nvim-style handling of string|array paths.
 local function load_psr4()
-	local json = vim.fn.json_decode(vim.fn.readfile("composer.json"))
+	local ok, raw = pcall(vim.fn.readfile, "composer.json")
+	if not ok or not raw or #raw == 0 then
+		return {}
+	end
+	local okj, json = pcall(vim.fn.json_decode, raw)
+	if not okj or type(json) ~= "table" then
+		return {}
+	end
+
 	local psr4 = {}
-	if json and json["autoload"] and json["autoload"]["psr-4"] then
-		for ns, paths in pairs(json["autoload"]["psr-4"]) do
+	local autoload = json["autoload"]
+	if autoload and autoload["psr-4"] then
+		for ns, paths in pairs(autoload["psr-4"]) do
 			if type(paths) == "string" then
 				psr4[ns] = { paths }
 			elseif type(paths) == "table" then
@@ -33,49 +45,40 @@ local function load_psr4()
 	return psr4
 end
 
--- Find fully-qualified name on the current line nearest to the cursor.
--- Matches things like \Intellex\Storage\Entity\Embedding\EmbeddingVectorInterface
--- Also handles nullable "?\" prefix by stripping '?'.
+-- Find fully qualified name near cursor (e.g. \Vendor\Pkg\Name)
 local function fqn_near_cursor()
-	local pos = vim.api.nvim_win_get_cursor(0) -- {row, col}, 1-based row, 0-based col
-	local row, col = pos[1], pos[2]
+	local row, col = unpack(vim.api.nvim_win_get_cursor(0)) -- row:1-based, col:0-based
 	local line = vim.api.nvim_buf_get_lines(0, row - 1, row, false)[1] or ""
 	if line == "" then
 		return nil
 	end
+	local c = col + 1 -- 1-based indexing for Lua strings
 
-	local c = col + 1 -- 1-based for Lua string indices
-
-	-- collect all \Foo\Bar occurrences with their spans
-	local candidates = {}
+	local spans = {}
 	for s, e in line:gmatch("()\\[%w_\\]+()") do
-		table.insert(candidates, { s = s, e = e - 1 }) -- inclusive end
+		table.insert(spans, { s = s, e = e - 1 })
 	end
-	if #candidates == 0 then
-		-- fallback: try to extract from the WORD under cursor (handles e.g. text objects)
+	if #spans == 0 then
 		local word = vim.fn.expand("<cWORD>")
-		local m = word:match("\\[%w_\\]+")
-		return m and m:gsub("^%?", "") or nil
+		local m = word and word:match("\\[%w_\\]+")
+		return m and m:gsub("^%?+", "") or nil
 	end
 
-	-- 1) pick the one covering the cursor, else
-	for _, span in ipairs(candidates) do
-		if c >= span.s and c <= span.e then
-			local fqn = line:sub(span.s, span.e):gsub("^%?", "")
-			return fqn
+	for _, sp in ipairs(spans) do
+		if c >= sp.s and c <= sp.e then
+			return line:sub(sp.s, sp.e):gsub("^%?+", "")
 		end
 	end
-	-- 2) pick the closest to the left, else 3) first to the right
 	local left, right
-	for _, span in ipairs(candidates) do
-		if span.e < c then
-			left = (not left or span.e > left.e) and span or left
-		elseif span.s > c then
-			right = (not right or span.s < right.s) and span or right
+	for _, sp in ipairs(spans) do
+		if sp.e < c then
+			left = (not left or sp.e > left.e) and sp or left
+		elseif sp.s > c then
+			right = (not right or sp.s < right.s) and sp or right
 		end
 	end
-	local chosen = left or right or candidates[1]
-	return chosen and line:sub(chosen.s, chosen.e):gsub("^%?", "") or nil
+	local chosen = left or right or spans[1]
+	return chosen and line:sub(chosen.s, chosen.e):gsub("^%?+", "") or nil
 end
 
 local function pick_trigger(filename)
@@ -87,6 +90,38 @@ local function pick_trigger(filename)
 	return nil
 end
 
+-- Find a LuaSnip snippet for current filetype by its trigger.
+local function get_snippet_by_trigger(trig)
+	local ok, ls = pcall(require, "luasnip")
+	if not ok then
+		return nil
+	end
+	local ft = vim.bo.filetype
+	if not ft or ft == "" then
+		return nil
+	end
+
+	local snips = ls.get_snippets(ft) or {}
+	-- In different LuaSnip versions this can be nested; scan recursively.
+	local function scan(tbl)
+		for _, v in pairs(tbl) do
+			if type(v) == "table" then
+				if (v.trig or v.trigger) == trig then
+					return v
+				end
+				local found = scan(v)
+				if found then
+					return found
+				end
+			end
+		end
+		return nil
+	end
+	return scan(snips)
+end
+
+-- --- main ------------------------------------------------------------------
+
 function M.create_from_namespace()
 	local fqn = fqn_near_cursor()
 	if not fqn then
@@ -94,15 +129,14 @@ function M.create_from_namespace()
 		return
 	end
 
-	-- ensure no leading backslash for matching against PSR-4 prefixes
 	local word = fqn:gsub("^\\+", "")
 	local psr4 = load_psr4()
 
 	-- longest-prefix match
-	local best_prefix, best_path
+	local best_prefix, best_base
 	for ns, paths in pairs(psr4) do
 		if word:sub(1, #ns) == ns and (#ns > #(best_prefix or "")) then
-			best_prefix, best_path = ns, paths[1] -- first path if multiple
+			best_prefix, best_base = ns, paths[1]
 		end
 	end
 	if not best_prefix then
@@ -111,30 +145,36 @@ function M.create_from_namespace()
 	end
 
 	local rel = word:sub(#best_prefix + 1):gsub("\\", "/")
-	local file = best_path .. rel .. ".php"
+	local file = best_base .. rel .. ".php"
 
 	local is_new = vim.fn.filereadable(file) == 0
 	if is_new then
 		vim.fn.mkdir(vim.fn.fnamemodify(file, ":h"), "p")
-		vim.fn.writefile({ "<?php", "declare(strict_types=1);", "" }, file)
+		-- touch empty file
+		vim.fn.writefile({}, file)
 	end
 
-	vim.cmd("edit " .. file)
+	vim.cmd("edit " .. vim.fn.fnameescape(file))
 
 	if is_new then
+		-- decide and expand snippet
 		local fname = vim.fn.fnamemodify(file, ":t")
 		local trig = pick_trigger(fname)
-		if trig then
-			vim.schedule(function()
-				local ls = require("luasnip")
-				local snip = ls.get_snippet_by_trigger(trig)
-				if snip then
-					ls.snip_expand(snip)
-				else
-					print("No snippet found for trigger: " .. trig)
-				end
-			end)
+		if not trig then
+			return
 		end
+
+		vim.schedule(function()
+			local snip = get_snippet_by_trigger(trig)
+			if not snip then
+				print("No LuaSnip snippet found for trigger: " .. trig)
+				return
+			end
+			-- make sure we're in insert mode and at BOF for clean expansion
+			vim.api.nvim_win_set_cursor(0, { 1, 0 })
+			vim.cmd("startinsert")
+			require("luasnip").snip_expand(snip)
+		end)
 	end
 end
 
