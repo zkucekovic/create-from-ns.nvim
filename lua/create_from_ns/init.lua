@@ -1,4 +1,3 @@
--- lua/create_from_ns/init.lua
 local M = {}
 
 M.config = {
@@ -7,7 +6,7 @@ M.config = {
 		{ pattern = "Trait", trigger = "trait" },
 		{ pattern = ".*", trigger = "class" },
 	},
-	keymap = nil, -- optional: { "n", "<leader>cn" } or { "n", "<leader>cn", "<cmd>CreateFromNS<CR>", { silent = true } }
+	keymap = nil, -- optional: { "n", "<leader>cn" }
 }
 
 function M.setup(opts)
@@ -18,9 +17,7 @@ function M.setup(opts)
 	end
 end
 
--- --- helpers ---------------------------------------------------------------
-
--- Parse PSR-4 (autoload only), using tdd.nvim-style handling of string|array paths.
+-- Parse PSR-4 (autoload only), like tdd.nvim
 local function load_psr4()
 	local ok, raw = pcall(vim.fn.readfile, "composer.json")
 	if not ok or not raw or #raw == 0 then
@@ -45,14 +42,14 @@ local function load_psr4()
 	return psr4
 end
 
--- Find fully qualified name near cursor (e.g. \Vendor\Pkg\Name)
+-- Find FQN near cursor (e.g. \Vendor\Pkg\Name)
 local function fqn_near_cursor()
-	local row, col = unpack(vim.api.nvim_win_get_cursor(0)) -- row:1-based, col:0-based
+	local row, col = unpack(vim.api.nvim_win_get_cursor(0))
 	local line = vim.api.nvim_buf_get_lines(0, row - 1, row, false)[1] or ""
 	if line == "" then
 		return nil
 	end
-	local c = col + 1 -- 1-based indexing for Lua strings
+	local c = col + 1
 
 	local spans = {}
 	for s, e in line:gmatch("()\\[%w_\\]+()") do
@@ -90,37 +87,38 @@ local function pick_trigger(filename)
 	return nil
 end
 
--- Find a LuaSnip snippet for current filetype by its trigger.
+-- Safe, non-recursive lookup using LuaSnip API
 local function get_snippet_by_trigger(trig)
 	local ok, ls = pcall(require, "luasnip")
 	if not ok then
 		return nil
 	end
-	local ft = vim.bo.filetype
-	if not ft or ft == "" then
-		return nil
-	end
 
-	local snips = ls.get_snippets(ft) or {}
-	-- In different LuaSnip versions this can be nested; scan recursively.
-	local function scan(tbl)
-		for _, v in pairs(tbl) do
-			if type(v) == "table" then
-				if (v.trig or v.trigger) == trig then
-					return v
-				end
-				local found = scan(v)
-				if found then
-					return found
-				end
+	local function find_in(ft)
+		if not ft or ft == "" then
+			return nil
+		end
+		-- regular snippets
+		local list = ls.get_snippets(ft, { type = "snippets" }) or {}
+		for _, s in ipairs(list) do
+			local t = s.trigger or s.trig
+			if t == trig then
+				return s
+			end
+		end
+		-- autosnippets too (in case user registered trigger there)
+		local autos = ls.get_snippets(ft, { type = "autosnippets" }) or {}
+		for _, s in ipairs(autos) do
+			local t = s.trigger or s.trig
+			if t == trig then
+				return s
 			end
 		end
 		return nil
 	end
-	return scan(snips)
-end
 
--- --- main ------------------------------------------------------------------
+	return find_in(vim.bo.filetype) or find_in("all")
+end
 
 function M.create_from_namespace()
 	local fqn = fqn_near_cursor()
@@ -150,14 +148,17 @@ function M.create_from_namespace()
 	local is_new = vim.fn.filereadable(file) == 0
 	if is_new then
 		vim.fn.mkdir(vim.fn.fnamemodify(file, ":h"), "p")
-		-- touch empty file
-		vim.fn.writefile({}, file)
+		vim.fn.writefile({}, file) -- touch only
 	end
 
 	vim.cmd("edit " .. vim.fn.fnameescape(file))
 
 	if is_new then
-		-- decide and expand snippet
+		-- ensure filetype is detected (empty buffer sometimes needs help)
+		if vim.bo.filetype == "" and file:match("%.php$") then
+			vim.cmd("setfiletype php")
+		end
+
 		local fname = vim.fn.fnamemodify(file, ":t")
 		local trig = pick_trigger(fname)
 		if not trig then
@@ -170,7 +171,6 @@ function M.create_from_namespace()
 				print("No LuaSnip snippet found for trigger: " .. trig)
 				return
 			end
-			-- make sure we're in insert mode and at BOF for clean expansion
 			vim.api.nvim_win_set_cursor(0, { 1, 0 })
 			vim.cmd("startinsert")
 			require("luasnip").snip_expand(snip)
